@@ -1,0 +1,450 @@
+ELF EXECUTABLE RECONSTRUCTION FROM A CORE IMAGE
+------------------------------------------------
+
+	- Silvio Cesare  <silvio@big.net.au>
+	- December 1999
+	- http://www.big.net.au/~silvio
+	- http://virus.beergrave.net/
+
+TABLE OF CONTENTS
+-----------------
+
+KERNEL CHANGES FROM 2.0 TO 2.2
+INTRODUCTION
+THE PROCESS IMAGE
+THE CORE IMAGE
+EXECUTABLE RECONSTRUCTION
+FAILURES IN RECONSTRUCTION
+USES OF RECONSTRUCTION
+
+
+KERNEL CHANGES FROM 2.0 TO 2.2
+------------------------------
+
+This article was written primarily in Linux 2.0.x but the code was patched to
+work in both 2.0.x and 2.2.x  If any inconsistancies occur in this article
+related to kernel changes (the ELF core dump image I know has changed.  No
+longer is the first PT_LOAD segment in the image the TEXT segment).  I may
+modify this article to reflect 2.2, but this is currently not planned.
+
+Silvio Cesare, 28 January 2000
+
+
+INTRODUCTION
+------------
+
+This article documents the results from experimenting with binary
+reconstruction of an ELF executable given a core dump or snapshot of the
+process image.  ELF knowledge is assumed and it is suggested that the
+interested reader understand the structure of an ELF binary before undertaking
+full understanding, but if only a rudimentary understanding of the
+reconstruction is required, then it may be possible to ignore ELF
+understanding.  A Linux implementation of this reconstruction code is provided.
+
+
+THE PROCESS IMAGE
+-----------------
+
+In summary, a core image is a dump of the process image at dump time.  The
+process image contains a number of loadable program segments or virtual
+memory regions.  In an ELF binary these are referred to by program headers
+and in the Linux kernel they are referred to as vm_area_struct's.  The actual
+core dump is a dump of the vm_area_struct's but these correspond to the
+program headers of the executable and shared libraries used to create the
+process image.  In Linux, a group of vm_area_struct's are referred to
+as a memory map or as a map in the proc file system.  A typical map is given
+below for a program using libc.
+
+debian# cat /proc/16114/maps
+08048000-08049000 r-xp 00000000 03:03 50198
+08049000-0804a000 rw-p 00000000 03:03 50198
+40000000-4000a000 r-xp 00000000 03:03 6001
+4000a000-4000c000 rw-p 00009000 03:03 6001
+4000c000-4000e000 r--p 00000000 03:03 30009
+4000e000-400a0000 r-xp 00000000 03:03 6030
+400a0000-400a7000 rw-p 00091000 03:03 6030
+400a7000-400b4000 rw-p 00000000 00:00 0
+bffff000-c0000000 rwxp 00000000 00:00 0
+
+The first two memory regions using virtual addresses 8048000 - 8049000 and
+8049000 - 804a000 correspond to the text and data segments respectively.
+Notice also that the permission bits represent this also.  Also notice that
+the memory regions only lie on page borders.  All memory regions in a core
+dump or mapping lie on page borders.  This means, that the smallest memory
+region is one page long.  It must also be noted that a program segment
+represented by a program header in an ELF binary does not have to lie on
+a page border, so program segments do not map one to one on virtual memory
+regions.  The following six mappings correspond to libc memory regions.
+The last region is the stack.
+
+
+THE CORE IMAGE
+--------------
+
+The core image as stated above is a dump of the process image with some
+extra sections for registers and any useful information.  In an ELF core
+image, the memory regions belonging to the process image as stated correspond
+to program segments, so a core file has a list of program headers each for
+each virtual memory region.  The register information and so forth is stored
+in a notes section in the ELF binary.  To reconstruct an executable from
+a core dump or process image we can ignore the registers and concentrate
+only on the memory regions.
+
+
+EXECUTABLE RECONSTRUCTION
+--------------------------
+
+To reconstruct an executable from a core dump we simply have to create
+the ELF execute Abel with the memory regions corresponding to the text and
+data segments of the core image.  It must be remembered, that when loading
+the text segment, the ELF header and program headers are also loaded into
+memory (for efficiency) so we can use these for our executable image.
+The executable ELF header contains such information as the true text and data
+segment start and size (remember the memory regions lie on page borders).
+
+Now, if we only use the text and data segments in our reconstruction, the
+result executable may only work on the system it was reconstructed on.
+This is because the Procedure Linkage Table (PLT) may have resolved shared
+library functions to point to its loaded value.  Moving the binary means
+that the library may be at a different position, or that the function may
+be at a different location.  Thus for true, system independence, the entire
+image excluding the stack must be used in the reconstructed executable.
+
+
+FAILURES IN RECONSTRUCTION
+--------------------------
+
+The problem with reconstruction, is that the snapshot of the process image is
+at runtime, not at initiation time, so its possible that the data segment
+which is writable may have changed values.  Consider the following code
+
+	static int i = 0;
+
+	int main()
+	{
+		if (i++) exit(0);
+		printf("Hi\n");
+	}
+
+In this instance, reconstructing the image will result in an executable that
+immediately exits because it relies on the initial value of the global
+variable 'i'.  The educated user may use debugging tools to find such code
+but for the uneducated user its not so easy.
+
+USES OF RECONSTRUCTION
+----------------------
+
+Reconstructing images does not have many uses outside academic use but one
+possible use is the ability to copy an executable that has only execute
+permission on.  Creating the core dump is easy by sending the process a
+SIGSEGV or alternately, the image may be copied from the process image in
+the proc filesystem.
+
+--
+
+$ cat test_harness.c
+int main()
+{
+	for (;;) printf("Hi\n");
+}
+$ gcc test_harness.c -o test_harness
+$ ./test_harness
+Hi
+Hi
+Hi
+.
+.
+.
+$ kill -SIGSEGV `ps|grep test_harness|grep -v grep|awk '{print $1}'`
+$ ./core_reconstruct
+$ ./a.out
+Hi
+Hi
+Hi
+.
+.
+.
+
+--------------------------------- CUT ---------------------------------------
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <elf.h>
+#include <stdarg.h>
+#include <string.h>
+
+void die(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc('\n', stderr);
+	exit(1);
+}
+
+#define PAGE_SIZE	4096
+
+static char shstr[] =
+	"\0"
+	".symtab\0"
+	".strtab\0"
+	".shstrtab\0"
+	".interp\0"
+	".hash\0"
+	".dynsym\0"
+	".dynstr\0"
+	".rel.got\0"
+	".rel.bss\0"
+	".rel.plt\0"
+	".init\0"
+	".plt\0"
+	".text\0"
+	".fini\0"
+	".rodata\0"
+	".data\0"
+	".ctors\0"
+	".dtors\0"
+	".got\0"
+	".dynamic\0"
+	".bss\0"
+	".comment\0"
+	".note"
+;
+
+char *xget(int fd, int off, int sz)
+{
+	char *buf;
+
+	if (lseek(fd, off, SEEK_SET) < 0) die("Seek error");
+	buf = (char *)malloc(sz);
+	if (buf == NULL) die("No memory");
+	if (read(fd, buf, sz) != sz) die("Read error");
+	return buf;
+}
+
+
+void do_elf_checks(Elf32_Ehdr *ehdr)
+{
+        if (strncmp(ehdr->e_ident, ELFMAG, SELFMAG)) die("File not ELF");
+        if (ehdr->e_type != ET_CORE) die("ELF type not ET_CORE");
+        if (ehdr->e_machine != EM_386 && ehdr->e_machine != EM_486)
+                die("ELF machine type not EM_386 or EM_486");
+        if (ehdr->e_version != EV_CURRENT) die("ELF version not current");
+}
+
+int main(int argc, char *argv[])
+{
+	Elf32_Ehdr ehdr, *core_ehdr;
+	Elf32_Phdr *phdr, *core_phdr, *tmpphdr;
+	Elf32_Shdr shdr;
+	char *core;
+	char *data[2], *core_data[3];
+	int prog[2], core_prog[3];
+	int in, out;
+	int i, p;
+	int plen;
+
+	if (argc > 2) die("usage: %s [core-file]");
+
+	if (argc == 2) core = argv[1];
+	else core = "core";
+	in = open(core, O_RDONLY);
+	if (in < 0) die("Coudln't open file: %s", core); 
+
+	if (read(in, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) die("Read error");
+	do_elf_checks(&ehdr);
+
+	if (lseek(in, ehdr.e_phoff, SEEK_SET) < 0) die("Seek error");
+	phdr = (Elf32_Phdr *)malloc(plen = sizeof(Elf32_Phdr)*ehdr.e_phnum);
+	if (read(in, phdr, plen) != plen) die("Read error");
+
+for (i = 0; i < ehdr.e_phnum; i++)
+printf("0x%x - 0x%x (%i)\n", 
+phdr[i].p_vaddr, phdr[i].p_vaddr + phdr[i].p_memsz, phdr[i].p_memsz);
+
+/*
+	copy segments (in memory)
+
+	prog/data[0] ... text
+	prog/data[1] ... data
+	prog/data[2] ... dynamic
+*/
+	for (i = 0, p = 0; i < ehdr.e_phnum; i++) {
+		if (
+			phdr[i].p_vaddr >= 0x8000000 &&
+			phdr[i].p_type == PT_LOAD
+		) {
+			prog[p] = i;
+			if (p == 1) break;
+			++p;
+		}
+	}
+	if (i == ehdr.e_phnum) die("Couldnt find TEXT/DATA");
+
+	for (i = 0; i < 2; i++) data[i] = xget(
+		in,
+		phdr[prog[i]].p_offset,
+		(phdr[prog[i]].p_memsz + 4095) & 4095
+	);
+
+	core_ehdr = (Elf32_Ehdr *)&data[0][0];
+	core_phdr = (Elf32_Phdr *)&data[0][core_ehdr->e_phoff];
+
+	for (i = 0, p = 0; i < core_ehdr->e_phnum; i++) {
+		if (core_phdr[i].p_type == PT_LOAD) {
+			core_prog[p] = i;
+			if (p == 0) {
+				core_data[0] = &data[0][0]; 
+			} else {
+				core_data[1] = &data[1][
+					(core_phdr[i].p_vaddr & 4095)
+				];
+				break;
+			}
+			++p;
+		}
+	}
+	if (i == core_ehdr->e_phnum) die("No TEXT and DATA segment");
+	for (i = 0; i < core_ehdr->e_phnum; i++) {
+		if (core_phdr[i].p_type == PT_DYNAMIC) {
+			core_prog[2] = i;
+			core_data[2] = &data[1][64];
+			break;
+		}
+	}
+	if (i == core_ehdr->e_phnum) die("No DYNAMIC segment");
+
+	out = open("a.out", O_WRONLY | O_CREAT | O_TRUNC);
+	if (out < 0) die("Coudln't open file: %s", "a.out");
+
+	core_ehdr->e_shoff =
+		core_phdr[core_prog[2]].p_offset +
+		core_phdr[core_prog[2]].p_filesz +
+		sizeof(shstr);
+
+/*
+	text
+	data
+	bss
+	dynamic
+	shstrtab
+*/
+	core_ehdr->e_shnum = 6;
+	core_ehdr->e_shstrndx = 5;
+
+	for (i = 0; i < 2; i++) {
+		Elf32_Phdr *p = &core_phdr[core_prog[i]];
+		int sz = p->p_filesz;
+
+		if (lseek(out, p->p_offset, SEEK_SET) < 0) goto cleanup;
+		if (write(out, core_data[i], sz) != sz) goto cleanup;
+	}
+
+	if (write(out, shstr, sizeof(shstr)) != sizeof(shstr)) goto cleanup;
+
+	memset(&shdr, 0, sizeof(shdr));
+	if (write(out, &shdr, sizeof(shdr)) != sizeof(shdr)) goto cleanup;
+
+/*
+	text section
+*/
+	tmpphdr = &core_phdr[core_prog[0]];
+
+	shdr.sh_name = 95;
+	shdr.sh_type = SHT_PROGBITS;
+	shdr.sh_addr = tmpphdr->p_vaddr;
+	shdr.sh_offset = 0;
+	shdr.sh_size = tmpphdr->p_filesz;
+	shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+	shdr.sh_link = 0;
+	shdr.sh_info = 0;
+	shdr.sh_addralign = 16;
+	shdr.sh_entsize = 0;
+
+	if (write(out, &shdr, sizeof(shdr)) != sizeof(shdr)) goto cleanup;
+
+/*
+	data section
+*/
+	tmpphdr = &core_phdr[core_prog[1]];
+
+	shdr.sh_name = 115;
+	shdr.sh_type = SHT_PROGBITS;
+	shdr.sh_addr = tmpphdr->p_vaddr;
+	shdr.sh_offset = tmpphdr->p_offset;
+	shdr.sh_size = tmpphdr->p_filesz;
+	shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
+	shdr.sh_link = 0;
+	shdr.sh_info = 0;
+	shdr.sh_addralign = 4;
+	shdr.sh_entsize = 0;
+
+	if (write(out, &shdr, sizeof(shdr)) != sizeof(shdr)) goto cleanup;
+
+/*
+	dynamic section
+*/
+	for (i = 0; i < core_ehdr->e_phnum; i++) {
+		if (core_phdr[i].p_type == PT_DYNAMIC) {
+			tmpphdr = &core_phdr[i];
+			break;
+		}
+	}
+
+	shdr.sh_name = 140;
+	shdr.sh_type = SHT_PROGBITS;
+	shdr.sh_addr = tmpphdr->p_vaddr;
+	shdr.sh_offset = tmpphdr->p_offset;
+	shdr.sh_size = tmpphdr->p_memsz;
+	shdr.sh_flags = SHF_ALLOC;
+	shdr.sh_link = 0;
+	shdr.sh_info = 0;
+	shdr.sh_addralign = 4;
+	shdr.sh_entsize = 8;
+
+	if (write(out, &shdr, sizeof(shdr)) != sizeof(shdr)) goto cleanup;
+
+/*
+	bss section
+*/
+	shdr.sh_name = 149;
+	shdr.sh_type = SHT_PROGBITS;
+	shdr.sh_addr = tmpphdr->p_vaddr + tmpphdr->p_filesz;
+	shdr.sh_offset = tmpphdr->p_offset + tmpphdr->p_filesz;
+	shdr.sh_size = tmpphdr->p_memsz - tmpphdr->p_filesz;
+	shdr.sh_flags = SHF_ALLOC;
+	shdr.sh_link = 0;
+	shdr.sh_info = 0;
+	shdr.sh_addralign = 1;
+	shdr.sh_entsize = 0;
+
+	if (write(out, &shdr, sizeof(shdr)) != sizeof(shdr)) goto cleanup;
+
+/*
+	shstrtab
+*/
+
+	shdr.sh_name = 17;
+	shdr.sh_type = SHT_STRTAB;
+	shdr.sh_addr = 0;
+	shdr.sh_offset = core_ehdr->e_shoff - sizeof(shstr);
+	shdr.sh_size = sizeof(shstr);
+	shdr.sh_flags = 0;
+	shdr.sh_link = 0;
+	shdr.sh_info = 0;
+	shdr.sh_addralign = 1;
+	shdr.sh_entsize = 0;
+
+	if (write(out, &shdr, sizeof(shdr)) != sizeof(shdr)) goto cleanup;
+
+	return 0;
+
+cleanup:
+	unlink("a.out");
+	die("Error writing file: %s", "a.out");
+	return 1; /* not reached */
+}
